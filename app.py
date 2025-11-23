@@ -6,12 +6,14 @@ from concurrent.futures import ThreadPoolExecutor
 import requests
 import json
 import threading
+import re
 
 # ---------------- CONFIG ----------------
 MAX_PAGES = 10        # maximum pages per crawl
 MAX_DEPTH = 2         # how deep to follow links
 THREADS = 10          # worker threads
 HEADERS = {"User-Agent": "Mozilla/5.0"}
+MAX_API_CALLS_PER_PAGE = 5  # limit API calls per page for safety
 # ----------------------------------------
 
 app = FastAPI(title="Streaming Structured Web Crawler API")
@@ -21,7 +23,10 @@ app = FastAPI(title="Streaming Structured Web Crawler API")
 
 def is_internal(base, link):
     """Check if link belongs to the same domain."""
-    return urlparse(base).netloc == urlparse(link).netloc
+    try:
+        return urlparse(base).netloc == urlparse(link).netloc
+    except Exception:
+        return False
 
 
 def is_login_page(url):
@@ -80,13 +85,179 @@ def extract_links(soup: BeautifulSoup, base_url: str):
     return links
 
 
-def build_structured_content(soup: BeautifulSoup, url: str):
+def json_to_sections(obj, heading_prefix="JSON"):
     """
-    Build structured, cleaned content:
+    Convert arbitrary JSON into section list:
+    [{ "heading": ..., "content": ... }]
+    """
+    texts_by_key = {}
+
+    def walk(o, path):
+        if isinstance(o, dict):
+            for k, v in o.items():
+                key = f"{path} / {k}" if path else k
+                walk(v, key)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v, path)
+        elif isinstance(o, str):
+            text = o.strip()
+            # ignore URLs and very short bits
+            if (
+                text
+                and len(text.split()) >= 5
+                and not text.lower().startswith(("http://", "https://"))
+            ):
+                key = path or heading_prefix
+                texts_by_key.setdefault(key, []).append(text)
+
+    walk(obj, heading_prefix)
+
+    sections = []
+    for heading, chunks in texts_by_key.items():
+        content = " ".join(chunks).strip()
+        if content:
+            sections.append({"heading": heading, "content": content})
+
+    return sections
+
+
+def extract_json_sections_from_scripts(soup: BeautifulSoup, base_url: str):
+    """
+    Hybrid step 1:
+    - Extract JSON-LD and other JSON blobs from <script> tags.
+    - Convert them into sections.
+    """
+    sections = []
+
+    # 1) JSON-LD or explicit JSON script tags
+    for script in soup.find_all("script"):
+        script_type = (script.get("type") or "").lower()
+        script_text = script.string or script.get_text()
+        if not script_text:
+            continue
+
+        # JSON-LD or generic JSON inside script
+        if "json" in script_type:
+            try:
+                data = json.loads(script_text)
+                sections.extend(json_to_sections(data, heading_prefix="JSON-LD"))
+            except Exception:
+                continue
+            continue
+
+    # 2) Look for common framework data assignments in generic script tags
+    assign_patterns = [
+        r"__NEXT_DATA__\s*=\s*(\{.*\})",
+        r"__NUXT__\s*=\s*(\{.*\})",
+        r"__INITIAL_STATE__\s*=\s*(\{.*\})",
+        r"window\.__INITIAL_STATE__\s*=\s*(\{.*\})",
+    ]
+    combined_pattern = re.compile("|".join(assign_patterns), re.DOTALL)
+
+    for script in soup.find_all("script"):
+        script_type = (script.get("type") or "").lower()
+        if "json" in script_type:
+            # already processed above
+            continue
+        script_text = script.string or script.get_text()
+        if not script_text:
+            continue
+
+        for match in combined_pattern.finditer(script_text):
+            # Find which group matched
+            for group in match.groups():
+                if not group:
+                    continue
+                candidate = group.strip()
+                # Attempt to balance braces by trimming crud at the ends
+                # (best-effort; failures are silently ignored)
+                try:
+                    data = json.loads(candidate)
+                    sections.extend(json_to_sections(data, heading_prefix="App State"))
+                except Exception:
+                    continue
+
+    return sections
+
+
+def extract_api_urls_from_scripts(soup: BeautifulSoup, base_url: str):
+    """
+    Hybrid step 2:
+    - Find fetch / axios / $.get JSON API calls in script tags.
+    - Return a set of internal URLs to try as JSON APIs.
+    """
+    api_urls = set()
+
+    pattern = re.compile(
+        r"""(?:fetch|axios\.get|axios\.post|axios\(|\$\.getJSON|\$\.get)\s*\(\s*["']([^"']+)["']""",
+        re.IGNORECASE,
+    )
+
+    for script in soup.find_all("script"):
+        text = script.string or script.get_text()
+        if not text:
+            continue
+
+        for match in pattern.finditer(text):
+            raw = match.group(1).strip()
+            if not raw:
+                continue
+            full = urljoin(base_url, raw)
+            if is_internal(base_url, full):
+                api_urls.add(full)
+
+    return list(api_urls)
+
+
+def fetch_api_json_sections(api_urls, base_url: str):
+    """
+    For each detected API URL:
+    - Fetch via GET
+    - If JSON, convert to sections
+    """
+    sections = []
+    count = 0
+
+    for url in api_urls:
+        if count >= MAX_API_CALLS_PER_PAGE:
+            break
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=10)
+            content_type = resp.headers.get("Content-Type", "").lower()
+            if "json" not in content_type and not resp.text.strip().startswith(("{", "[")):
+                continue
+
+            data = resp.json()
+            heading_prefix = f"API {urlparse(url).path or '/'}"
+            sections.extend(json_to_sections(data, heading_prefix=heading_prefix))
+            count += 1
+        except Exception:
+            continue
+
+    return sections
+
+
+def sections_to_clean_text(sections):
+    """Convert sections into a single clean_text string."""
+    chunks = []
+    for sec in sections:
+        heading = (sec.get("heading") or "").strip()
+        content = (sec.get("content") or "").strip()
+        if content:
+            if heading:
+                chunks.append(heading)
+            chunks.append(content)
+    return "\n\n".join(chunks)
+
+
+def build_structured_content_from_html(soup: BeautifulSoup, url: str):
+    """
+    Build structured, cleaned content from static HTML only:
     - title
-    - clean_text (joined sections)
     - sections: [{heading, content}]
     """
+
     # Remove obvious noise tags from the tree for cleaner extraction
     for tag_name in ["script", "style", "noscript", "header", "footer", "nav", "form", "aside"]:
         for t in soup.find_all(tag_name):
@@ -137,16 +308,7 @@ def build_structured_content(soup: BeautifulSoup, url: str):
         if content:
             sections.append({"heading": current_heading.strip(), "content": content})
 
-    # Clean text for embedding: heading + content joined
-    clean_chunks = []
-    for sec in sections:
-        if sec["content"]:
-            if sec["heading"]:
-                clean_chunks.append(sec["heading"])
-            clean_chunks.append(sec["content"])
-    clean_text = "\n\n".join(clean_chunks)
-
-    return title, clean_text, sections
+    return title, sections
 
 
 # ---------- SINGLE PAGE CRAWLER ----------
@@ -172,15 +334,33 @@ def crawl_single(url, depth, base_url, visited, lock, max_depth, max_pages):
         response.raise_for_status()
         soup = BeautifulSoup(response.text, "html.parser")
 
+        # 1) PDFs and images
         pdfs, images = extract_media(soup, url)
+
+        # 2) All links (for metadata)
         links = extract_links(soup, url)
-        title, clean_text, sections = build_structured_content(soup, url)
+
+        # 3) Hybrid JSON from scripts (inline JSON, framework state)
+        json_script_sections = extract_json_sections_from_scripts(soup, url)
+
+        # 4) API URLs from scripts + JSON from APIs
+        api_urls = extract_api_urls_from_scripts(soup, url)
+        api_sections = fetch_api_json_sections(api_urls, url)
+
+        # 5) Static HTML content sections
+        title, html_sections = build_structured_content_from_html(soup, url)
+
+        # 6) Merge sections: HTML + JSON-script + API JSON
+        all_sections = html_sections + json_script_sections + api_sections
+
+        # 7) Build final clean_text
+        clean_text = sections_to_clean_text(all_sections)
 
         page_data = {
             "url": url,
             "title": title,
             "clean_text": clean_text,
-            "sections": sections,
+            "sections": all_sections,
             "links": links,
             "pdfs": pdfs,
             "images": images,
