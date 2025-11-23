@@ -89,29 +89,46 @@ def json_to_sections(obj, heading_prefix="JSON"):
     """
     Convert arbitrary JSON into section list:
     [{ "heading": ..., "content": ... }]
+    Only keeps readable, non-URL-ish text fields (Option B).
     """
     texts_by_key = {}
 
-    def walk(o, path):
+    # keys that likely represent headings / groups
+    HEADING_KEYS = {"title", "heading", "name"}
+    CONTENT_KEYS = {
+        "description", "overview", "summary", "details",
+        "body", "content", "text", "objective", "objectives",
+        "outcome", "outcomes", "eligibility", "syllabus"
+    }
+
+    def add_text(key_path, text):
+        text = text.strip()
+        if not text:
+            return
+        # ignore URLs and super-short fragments
+        if text.lower().startswith(("http://", "https://")):
+            return
+        if len(text.split()) < 5:  # fewer than 5 words = probably noise
+            return
+        key = key_path or heading_prefix
+        texts_by_key.setdefault(key, []).append(text)
+
+    def walk(o, path, last_key=None):
         if isinstance(o, dict):
             for k, v in o.items():
-                key = f"{path} / {k}" if path else k
-                walk(v, key)
+                new_path = f"{path} / {k}" if path else k
+                walk(v, new_path, k)
         elif isinstance(o, list):
             for v in o:
-                walk(v, path)
+                walk(v, path, last_key)
         elif isinstance(o, str):
-            text = o.strip()
-            # ignore URLs and very short bits
-            if (
-                text
-                and len(text.split()) >= 5
-                and not text.lower().startswith(("http://", "https://"))
-            ):
-                key = path or heading_prefix
-                texts_by_key.setdefault(key, []).append(text)
+            # Only keep strings that come from "content-ish" keys or
+            # top-level-ish locations. This is Option B: readable text only.
+            key_lower = (last_key or "").lower()
+            if key_lower in CONTENT_KEYS or key_lower in HEADING_KEYS or not last_key:
+                add_text(path, o)
 
-    walk(obj, heading_prefix)
+    walk(obj, heading_prefix, None)
 
     sections = []
     for heading, chunks in texts_by_key.items():
@@ -126,7 +143,7 @@ def extract_json_sections_from_scripts(soup: BeautifulSoup, base_url: str):
     """
     Hybrid step 1:
     - Extract JSON-LD and other JSON blobs from <script> tags.
-    - Convert them into sections.
+    - Convert them into sections (readable text only).
     """
     sections = []
 
@@ -148,10 +165,10 @@ def extract_json_sections_from_scripts(soup: BeautifulSoup, base_url: str):
 
     # 2) Look for common framework data assignments in generic script tags
     assign_patterns = [
-        r"__NEXT_DATA__\s*=\s*(\{.*\})",
-        r"__NUXT__\s*=\s*(\{.*\})",
-        r"__INITIAL_STATE__\s*=\s*(\{.*\})",
-        r"window\.__INITIAL_STATE__\s*=\s*(\{.*\})",
+        r"__NEXT_DATA__\s*=\s*(\{.*?\})",
+        r"__NUXT__\s*=\s*(\{.*?\})",
+        r"__INITIAL_STATE__\s*=\s*(\{.*?\})",
+        r"window\.__INITIAL_STATE__\s*=\s*(\{.*?\})",
     ]
     combined_pattern = re.compile("|".join(assign_patterns), re.DOTALL)
 
@@ -165,13 +182,10 @@ def extract_json_sections_from_scripts(soup: BeautifulSoup, base_url: str):
             continue
 
         for match in combined_pattern.finditer(script_text):
-            # Find which group matched
             for group in match.groups():
                 if not group:
                     continue
                 candidate = group.strip()
-                # Attempt to balance braces by trimming crud at the ends
-                # (best-effort; failures are silently ignored)
                 try:
                     data = json.loads(candidate)
                     sections.extend(json_to_sections(data, heading_prefix="App State"))
@@ -184,22 +198,40 @@ def extract_json_sections_from_scripts(soup: BeautifulSoup, base_url: str):
 def extract_api_urls_from_scripts(soup: BeautifulSoup, base_url: str):
     """
     Hybrid step 2:
-    - Find fetch / axios / $.get JSON API calls in script tags.
+    - Find JSON API calls in script tags:
+      * fetch("...")
+      * axios.get("...")
+      * $.get("...")
+      * any literal "/api/..." URL in scripts
     - Return a set of internal URLs to try as JSON APIs.
     """
     api_urls = set()
 
+    # Classic JS patterns: fetch, axios, $.get, etc.
     pattern = re.compile(
         r"""(?:fetch|axios\.get|axios\.post|axios\(|\$\.getJSON|\$\.get)\s*\(\s*["']([^"']+)["']""",
         re.IGNORECASE,
     )
+
+    # Generic "/api/..." literals anywhere in JS
+    api_literal_pattern = re.compile(r"""["'](\/api\/[^"'<>]+)["']""", re.IGNORECASE)
 
     for script in soup.find_all("script"):
         text = script.string or script.get_text()
         if not text:
             continue
 
+        # fetch/axios/etc
         for match in pattern.finditer(text):
+            raw = match.group(1).strip()
+            if not raw:
+                continue
+            full = urljoin(base_url, raw)
+            if is_internal(base_url, full):
+                api_urls.add(full)
+
+        # bare "/api/..." literals
+        for match in api_literal_pattern.finditer(text):
             raw = match.group(1).strip()
             if not raw:
                 continue
@@ -214,7 +246,7 @@ def fetch_api_json_sections(api_urls, base_url: str):
     """
     For each detected API URL:
     - Fetch via GET
-    - If JSON, convert to sections
+    - If JSON, convert to sections (readable text only).
     """
     sections = []
     count = 0
@@ -225,7 +257,8 @@ def fetch_api_json_sections(api_urls, base_url: str):
         try:
             resp = requests.get(url, headers=HEADERS, timeout=10)
             content_type = resp.headers.get("Content-Type", "").lower()
-            if "json" not in content_type and not resp.text.strip().startswith(("{", "[")):
+            text = resp.text.strip()
+            if "json" not in content_type and not text.startswith(("{", "[")):
                 continue
 
             data = resp.json()
